@@ -189,7 +189,10 @@ function test(model, dataset)
 
     -- confusion matrix to hold test accuracy
     local classes = torch.linspace(0,9,10):totable() -- {0,1,2,3,4,5,6,7,8,9}
-    local confusion = optim.ConfusionMatrix(classes)
+    local num_classes = #classes
+    local confusion = torch.zeros(num_classes, num_classes)
+    -- local confusion = optim.ConfusionMatrix(classes)
+
 
     for t = 1,dataset.size do
 
@@ -202,14 +205,31 @@ function test(model, dataset)
         pred = oneHotDecoding(pred)
 
         -- update confusion matrix
-        confusion:add(pred+1, target+1) -- because of the lua 1-indexing scheme
+        confusion[pred+1][target+1] = confusion[pred+1][target+1] + 1
+        -- confusion:add(pred+1, target+1) -- because of the lua 1-indexing scheme
         
     end
 
     -- accuracy info
-    acc = confusion.totalValid * 100
+    diag = confusion[torch.eye(num_classes):byte()]
+    acc = torch.sum(diag)/torch.sum(confusion)
+
+    precission = torch.Tensor(num_classes)
+    recall = torch.Tensor(num_classes)
+    f_score = torch.Tensor(num_classes)
+
+    for i=1,num_classes do
+        precission[i] = confusion[i][i] / torch.sum(confusion[i])       -- sum over rows (other --> clas i)
+        recall[i] = confusion[i][i] / torch.sum(confusion[{{},i}])      -- sum over columns ()
+        f_score[i] = 2*(precission[i] * recall[i]) / (precission[i] + recall[i])
+    end
+
+    print('Classification accuracy:', acc)
+    print('Precission:', precission:reshape(1,10))
+    print('Recall', recall:reshape(1,10))
+    print('Fscore', f_score:reshape(1,10))
+
     --monitorimage.display(confusion:render())
-    print(string.format('Classification accuracy: %f', acc))
 
     -- time measurement
     elapsed = sys.clock() - start
@@ -245,7 +265,7 @@ function main()
     while train_err > 0.01 do
         -- train stage
         train_err = train(model, criterion, train_data)
-        print(string.format('Training error=%f',train_err))
+        print('Training error=',train_err)
 
         -- saving the model
         local filename = paths.concat(save_path, 'convNet_r' .. tostring(round) .. '.net')
@@ -254,8 +274,7 @@ function main()
 
         -- test stage
         test_err = test(model, test_data)
-        print(string.format('Test error=%f', test_err))
-
+        print('Test error=', test_err)
 
 
         -- plot evolution
@@ -263,13 +282,15 @@ function main()
         testLogger:style{['% mean class accuracy (test set)'] = '-'}
         trainLogger:plot()
         testLogger:plot()
+
+        round = round + 1
     end
 end
 
 
 main()
 
--- model = torch.load('models/convNet_e200.net')
+-- model = torch.load('models/convNet_r1.net')
 -- train_data, test_data = preProcessData(getData())
 
 -- test(model, test_data)
