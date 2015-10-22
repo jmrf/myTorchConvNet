@@ -11,6 +11,7 @@ torch.setdefaulttensortype('torch.FloatTensor')
 classes = torch.linspace(0,9,10):totable() -- {0,1,2,3,4,5,6,7,8,9}
 num_classes = #classes
 data_format = 'table'
+cuda_enabled = false
 
 
 --[[ 
@@ -45,8 +46,8 @@ end
 function preProcessData_table(trainset, testset)
 
     -- transofrm this to Tensor (x + oneHot(y)) x trainset.size and compare performace on gpus vs cpu and optimal batch size.
-    print(string.format('Training instances: %i',trainset.size))
-    print(string.format('Testing instances: %i',testset.size))
+    print('Training instances:',trainset.size)
+    print('Testing instances:',testset.size)
 
     -- train input normalization and label oneHotEncoding
     local train = {}
@@ -71,8 +72,8 @@ end
 
 function preProcessData_tensor(trainset, testset)
 
-    print(string.format('Training instances: %i',trainset.size))
-    print(string.format('Testing instances: %i',testset.size))
+    print('Training instances:',trainset.size)
+    print('Testing instances:',testset.size)
 
     -- preprocess all the data in a Tensor format, so sending chunks forward through the network is easier.
     local img_size = trainset[1].x:size()
@@ -96,6 +97,8 @@ end
 
 function getMiniBatch(dataset,batch_size, batch_num, b)
     -- dirty way of doing, just for testing purposes....
+    -- notice the 3rd returnning value, actually acts the control of the loop:
+    -- if we do it in the tensorized way we only perform 1 pass of the loop (all data forwarded to the network at once)
     local inputs
     local targets
     if data_format == 'table' then
@@ -106,9 +109,11 @@ function getMiniBatch(dataset,batch_size, batch_num, b)
 
     elseif data_format == 'tensor' then
         -- provide a tensor'd form to provide many inputs at a time
-        inputs = dataset[{{1,batch_size},{1,-num_classes-1}}]
-        targets = dataset[{{1,batch_size},{-num_classes,-1}}]
-        return inputs, targets, batch_size
+        local ini = batch_num*batch_size + 1
+        local fin = ini + batch_size - 1
+        inputs = dataset[{{ini,fin},{1,-num_classes-1}}]
+        targets = dataset[{{ini,fin},{-num_classes,-1}}]
+        return inputs, targets, batch_size+1
     else
         print('Invalid data format detected...')
     end
@@ -131,18 +136,18 @@ function create_cnn_model()
     local model = nn.Sequential()
     model:add(nn.Reshape(1,28,28))
     -- layer 1:
-    model:add(nn.SpatialConvolution(1,16,5,5))          -- 16 x 24 x 24
+    model:add(nn.SpatialConvolution(1,4,5,5))          -- 4 x 24 x 24
     model:add(nn.Tanh())
-    model:add(nn.SpatialAveragePooling(2,2,2,2))        -- 16 x 12x 12
+    model:add(nn.SpatialAveragePooling(2,2,2,2))        -- 4 x 12x 12
     -- layer 2:
-    model:add(nn.SpatialConvolution(16,256,5,5))        -- 256 x 8 x 8
+    model:add(nn.SpatialConvolution(4,16,5,5))        -- 16 x 8 x 8
     model:add(nn.Tanh())
-    model:add(nn.SpatialAveragePooling(2,2,2,2))        -- 256 x 4 x 4       
+    model:add(nn.SpatialAveragePooling(2,2,2,2))        -- 16 x 4 x 4       
     -- layer 3 (2 fully connected neural nets):
-    model:add(nn.Reshape(256*4*4))
-    model:add(nn.Linear(256*4*4,200))
+    model:add(nn.Reshape(16*4*4))
+    model:add(nn.Linear(16*4*4,100))
     model:add(nn.Tanh())
-    model:add(nn.Linear(200,10))
+    model:add(nn.Linear(100,10))
     model:add(nn.SoftMax())
     
     return model
@@ -151,10 +156,12 @@ end
 
 function train(model, criterion, dataset)
 
+    print('\n---------------- TRAIN ----------------\n')
+
     -- training conf
-    local MAX_EPOCH = 100
+    local MAX_EPOCH = 200
     local coefL1 = 0
-    local coefL2 = 0
+    local coefL2 = 0.01
     local batch_size
 
     if data_format == 'table' then
@@ -168,10 +175,12 @@ function train(model, criterion, dataset)
     -- printing some info before starting the training
     print('Total number of epochs: ', MAX_EPOCH)
     print('Batch size:', batch_size)
+    print('Data format:', data_format)
+    print('Using GPU:', cuda_enabled)
 
     -- Stochastic Gradient Descent configuration
     local sgd_config = {
-        learningRate = 1,
+        learningRate = 0.1,
         learningRateDecay = 5.0e-6,
         momentum = 0.9,
     }
@@ -181,11 +190,10 @@ function train(model, criterion, dataset)
 
     -- retrieve model parameters and gradients (init with random weights)
     parameters,gradParameters  = model:getParameters()
-    parameters:uniform(-0.05,0.05)
+    parameters:uniform(-0.1,0.1)
 
     -- train for the specified number of epochs
     batch_num = 0
-    ejecuciones_bucle = 0
 
     for epoch = 1,MAX_EPOCH do
 
@@ -211,10 +219,12 @@ function train(model, criterion, dataset)
             
             while b <= batch_size do
 
-                -- get minibatch
+                -- get minibatch (remove sending to GPU from training function --> encapsulate elsewhere)
                 inputs, targets,b = getMiniBatch(dataset, batch_size, batch_num, b)
-                -- inputs = inputs:cuda()
-                -- targets = targets:cuda()
+                if cuda_enabled then
+                    inputs = inputs:cuda()
+                    targets = targets:cuda()
+                end
 
                 -- evaluate function for complete minibatch
                 local outputs = model:forward(inputs)
@@ -234,14 +244,11 @@ function train(model, criterion, dataset)
 
                 -- estimate dl/dw
                 dl_do = criterion:backward(outputs, targets)
-                -- dl_do:cuda()
+                if cuda_enabled then
+                    dl_do = dl_do:cuda()
+                end
                 model:backward(inputs, dl_do)
-
-
-                ejecuciones_bucle = ejecuciones_bucle + 1
             end
-
-            -- print('Ejecuciones del bucle interno: ', ejecuciones_bucle)
 
             -- normalize by the batch size
             gradParameters:div(batch_size)
@@ -269,8 +276,7 @@ end
 
 function test(model, dataset)
 
-
-    print('\n---------------- Test ----------------\n')
+    print('\n---------------- TEST ----------------\n')
 
     -- time measurement
     local start = sys.clock()
@@ -295,7 +301,7 @@ function test(model, dataset)
         local inputs
         local targets
         if data_format == 'table' then
-            inputs = dataset[t].x
+            inputs = dataset[t].x:float()
             targets = oneHotDecoding(dataset[t].y)
         elseif data_format == 'tensor' then
             inputs = dataset[{t,{1,-num_classes-1}}]
@@ -304,8 +310,13 @@ function test(model, dataset)
             print("Data format not recognized")
         end
 
+        if cuda_enabled then
+            inputs = inputs:cuda()
+        end
+
         -- forward pass
         local pred = model:forward(inputs)
+        if cuda_enabled then pred = pred:float() end
         pred = oneHotDecoding(pred)
 
         -- update confusion matrix
@@ -380,8 +391,10 @@ function main()
 
 
     -- move everuthing to GPU to speed up
-    -- model:cuda()
-    -- criterion:cuda()
+    if cuda_enabled then
+        model:cuda()
+        criterion:cuda()
+    end
 
     round = 1
     while train_err > 0.01 do
@@ -390,7 +403,11 @@ function main()
         print('Training error=',train_err)
 
         -- saving the model
-        local filename = paths.concat(save_path, 'convNet_r' .. tostring(round) .. '.net')
+        local ext = '.net'
+        if cuda_enabled then 
+            ext = '_cuda' .. ext
+        end
+        local filename = paths.concat(save_path, 'convNet_r' .. tostring(round) .. '_' .. data_format .. ext)
         os.execute('mkdir -p ' .. sys.dirname(filename))
         torch.save(filename, model)
 
@@ -412,7 +429,6 @@ end
 
 main()
 
--- model = torch.load('models/convNet_r1.net')
--- train_data, test_data = preProcessData(getData())
-
+-- model = torch.load('models/convNet_r1_tensor.net')
+-- train_data, test_data = preProcessData_tensor(getData())
 -- test(model, test_data)
