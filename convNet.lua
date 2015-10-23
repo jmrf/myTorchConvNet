@@ -1,14 +1,28 @@
+require 'gnuplot'
 require 'torch'
 require 'optim'
 require 'paths'
 require 'image'
 require 'nn'
 
--- require 'util.LogsLoader'
+require 'cutorch'
+require 'cunn'
 
 
 -- needed in order to make all the layers work!
 torch.setdefaulttensortype('torch.FloatTensor')
+
+
+-- training conf
+coefL1 = 0
+coefL2 = 0
+batch_size = 200
+sgd_config = {
+    learningRate = 1,
+    learningRateDecay = 5.0e-3,
+    momentum = 0.9,
+}
+cuda_enabled = true
 
 
 function create_cnn_model()
@@ -64,6 +78,32 @@ function preProcessData(trainset, testset)
     print(string.format('Training instances: %i',trainset.size))
     print(string.format('Testing instances: %i',testset.size))
 
+    local tx_trainset = torch.Tensor(trainset.size,28*28)
+    local ty_trainset = torch.Tensor(trainset.size,10)
+    local tx_testset = torch.Tensor(testset.size,28*28)
+    local ty_testset = torch.Tensor(testset.size,10)
+
+    for i=1,trainset.size do
+        tx_trainset[{i,{}}] = (trainset[i].x:float()-torch.Tensor(28,28):fill(128))/255
+        ty_trainset[{i,{}}] = oneHotEncoding(trainset[i].y)
+    end
+
+    for i=1,testset.size do
+        tx_testset[{i,{}}] = (testset[i].x:float()-torch.Tensor(28,28):fill(128))/255
+        ty_testset[{i,{}}] = oneHotEncoding(testset[i].y)
+    end
+    return tx_trainset,ty_trainset,tx_testset,ty_testset
+end
+
+
+
+function preProcessData_old(trainset, testset)
+
+    -- transofrm this to Tensor (x + oneHot(y)) x trainset.size and compare performace on gpus vs cpu and optimal batch size.
+
+    print(string.format('Training instances: %i',trainset.size))
+    print(string.format('Testing instances: %i',testset.size))
+
     -- train input normalization and label oneHotEncoding
     local train = {}
     train.size = trainset.size
@@ -85,18 +125,16 @@ end
 
 
 
-function train(model, criterion, dataset)
+function train(model, criterion, dataset_x, dataset_y)
 
-    -- training conf
-    local MAX_EPOCH = 200
-    local coefL1 = 0
-    local coefL2 = 0
-    local batch_size = dataset.size/MAX_EPOCH     -- by now it is ok
-    local sgd_config = {
-        learningRate = 1,
-        learningRateDecay = 5.0e-6,
-        momentum = 0.9,
-    }
+
+    print('-----------------TRAIN-----------------')
+
+    -- train for the specified number of batches
+    total_batches = dataset_x:size()[1]/batch_size
+    errors = torch.Tensor(total_batches-1)
+    print('Batch size:',batch_size)
+    print('Total_batches:',total_batches)
 
 
     local train_start = sys.clock()
@@ -104,13 +142,11 @@ function train(model, criterion, dataset)
     -- retrieve model parameters and gradients
     parameters,gradParameters  = model:getParameters()
 
-    -- train for the specified number of epochs
-    batch_num = 0
-
-    for epoch = 1,MAX_EPOCH do
+    local batch
+    for batch = 1,total_batches-1 do
 
         -- display progress (only works if using console)
-        xlua.progress(epoch, MAX_EPOCH)
+        xlua.progress(batch, total_batches)
 
         -- time measurement
         local start = sys.clock()
@@ -127,11 +163,17 @@ function train(model, criterion, dataset)
             local f = 0
             gradParameters:zero()
 
-            for b = 1,batch_size do
+            for b=1,batch_size do
 
                 -- get minibatch
-                local inputs = dataset[batch_num*batch_size + b].x
-                local targets = dataset[batch_num*batch_size + b].y
+                local inputs = dataset_x[batch*batch_size + b]
+                local targets = dataset_y[batch*batch_size + b]
+
+
+                if cuda_enabled then
+                    inputs = inputs:cuda()
+                    targets = targets:cuda()
+                end
 
                 -- evaluate function for complete minibatch
                 local outputs = model:forward(inputs)
@@ -151,7 +193,13 @@ function train(model, criterion, dataset)
 
                 -- estimate dl/dw
                 dl_do = criterion:backward(outputs, targets)
-                model:backward(inputs, dl_do)
+
+                -- GPU computation
+                if cuda_enabled then
+                    model:backward(inputs, dl_do:cuda())
+                else
+                    model:backward(inputs, dl_do)
+                end
 
             end
 
@@ -167,7 +215,7 @@ function train(model, criterion, dataset)
 
         -- optimization step SGD
         x,fx = optim.sgd(feval, parameters, sgd_config)
-        batch_num = batch_num + 1
+        errors[batch] = fx[1]
 
         -- local elapsed = sys.clock() - start
         -- print(string.format('Elapsed time: %f', elapsed))
@@ -175,14 +223,23 @@ function train(model, criterion, dataset)
     end
 
     local train_elapsed = sys.clock() - train_start
-    print(string.format('Total elapsed training time for %i epochs: %f', MAX_EPOCH, train_elapsed))
+    -- print(string.format('Total elapsed training time for %i batch: %f', batch, train_elapsed))
+
+    -- actual plot
+    gnuplot.figure(1)
+    gnuplot.title('Training error')
+    gnuplot.xlabel('batch number')
+    gnuplot.ylabel('Mean Square Error')
+    gnuplot.plot(errors)
 
     return fx[1]
 end
 
 
 
-function test(model, dataset)
+function test(model, dataset_x, dataset_y)
+
+    print('-----------------TEST-----------------')
 
     -- time measurement
     local start = sys.clock()
@@ -194,15 +251,21 @@ function test(model, dataset)
     -- local confusion = optim.ConfusionMatrix(classes)
 
 
-    for t = 1,dataset.size do
+    for t = 1,dataset_x:size()[1] do
 
         -- get data
-        local input = dataset[t].x
-        local target = oneHotDecoding(dataset[t].y)
+        local input = dataset_x[t]
+        local target = oneHotDecoding(dataset_y[t])
 
         -- forward pass
-        local pred = model:forward(input)
-        pred = oneHotDecoding(pred)
+        local pred
+        if cuda_enabled then
+            pred = model:forward(input:cuda())
+            pred = oneHotDecoding(pred:float())
+        else
+            pred = model:forward(input)
+            pred = oneHotDecoding(pred)
+        end
 
         -- update confusion matrix
         confusion[pred+1][target+1] = confusion[pred+1][target+1] + 1
@@ -225,9 +288,9 @@ function test(model, dataset)
     end
 
     print('Classification accuracy:', acc)
-    print('Precission:', precission:reshape(1,10))
-    print('Recall', recall:reshape(1,10))
-    print('Fscore', f_score:reshape(1,10))
+    print('Mean Precission:', torch.mean(precission))
+    print('Mean Recall', torch.mean(recall))
+    print('Mean Fscore', torch.mean(f_score))
 
     --monitorimage.display(confusion:render())
 
@@ -242,38 +305,41 @@ end
 
 function main()
 
-    -- coded like this by now. TODO: parametrize and generalize
-    word_embedding_size = 300
-    sentence_size = 6
-    
     -- logging variables
     save_path = '/users/josemarcos/Desktop/convNet/models'
     trainLogger = optim.Logger(paths.concat(save_path, 'train.log'))
     testLogger = optim.Logger(paths.concat(save_path, 'test.log'))
 
-    -- model
-    model = create_cnn_model()
-    criterion = nn.MSECriterion()
-
     -- datasets
-    train_data, test_data = preProcessData(getData())
+    train_x,train_y, test_x,test_y = preProcessData(getData())
     train_err = 1/0
     test_err = 1/0
 
 
-    round = 1
-    while train_err > 0.01 do
+    -- model
+    model = create_cnn_model()
+    criterion = nn.MSECriterion()
+
+    -- ship model to the GPU
+    if cuda_enabled then
+        model:cuda()
+        criterion:cuda()
+    end
+
+    epoch = 1
+
+    while train_err > 0.01 or epoch < 10 do
         -- train stage
-        train_err = train(model, criterion, train_data)
+        train_err = train(model, criterion, train_x, train_y)
         print('Training error=',train_err)
 
         -- saving the model
-        local filename = paths.concat(save_path, 'convNet_r' .. tostring(round) .. '.net')
+        local filename = paths.concat(save_path, 'convNet_r' .. tostring(epoch) .. '.net')
         os.execute('mkdir -p ' .. sys.dirname(filename))
         torch.save(filename, model)
 
         -- test stage
-        test_err = test(model, test_data)
+        test_err = test(model, test_x,test_y)
         print('Test error=', test_err)
 
 
@@ -283,15 +349,17 @@ function main()
         trainLogger:plot()
         testLogger:plot()
 
-        round = round + 1
+        epoch = epoch + 1
     end
 end
 
 
-main()
+-- main()
 
--- model = torch.load('models/convNet_r1.net')
--- train_data, test_data = preProcessData(getData())
 
--- test(model, test_data)
+model = torch.load('models/convNet_r1.net')
+_,_, test_x,test_y = preProcessData(getData())
+test(model, test_x, test_y)
+
+
 
